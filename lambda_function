@@ -1,0 +1,83 @@
+#Import all of the required libraries
+
+import boto3
+import json
+import io
+import urllib.parse
+import zipfile
+from datetime import datetime
+import base64
+#import cStringIO
+import zipfile
+
+
+def lambda_handler(event, context):
+    print("Received event: " + json.dumps(event, indent=2))
+    s3_client = boto3.client('s3')
+    bucket = event['Records'][0]['s3']['bucket']['name']
+    file_name = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+    
+    s3_clientobj = s3_client.get_object(Bucket=bucket, Key=file_name)
+    
+    #==================
+    print(s3_clientobj) #displaying the Bucket information and the required file to extract the info.
+    
+    bucket = bucket
+    object = file_name
+    phi_detection_threshold = 0.20
+
+    rekognition=boto3.client('rekognition')
+    comprehendmedical = boto3.client(service_name='comprehendmedical')
+    s3=boto3.resource('s3')
+    
+    #Download the image from S3 and hold it in memory
+    img_bucket = s3.Bucket(bucket)
+    img_object = img_bucket.Object(object)
+    xray = io.BytesIO()
+    img_object.download_fileobj(xray)
+    
+    response=rekognition.detect_text(Image={'Bytes':xray.getvalue()})
+    textDetections=response['TextDetections']
+    print(textDetections)
+    print('Aggregating detected text...')
+    textblock=""
+    offsetarray=[]
+    totallength=0
+    
+    for text in textDetections:
+        if text['Type'] == "LINE":
+                textblock=textblock+text['DetectedText']+" "  
+                print("adding '"+text['DetectedText']+"', length: "+str(len(text['DetectedText']))+'\n')
+    #Call Amazon Comprehend Medical and pass it the aggregated text from our medical image.
+    phi_boxes_list=[]
+    philist=comprehendmedical.detect_phi(Text = textblock)
+    phientity=comprehendmedical.detect_entities_v2(Text = textblock)
+    print(phientity)
+    print(philist)
+    
+    local_path = "/tmp/" #Lambda local storage to handly the json files
+    output_key = "processedimages/"+ file_name #output path to store the zip files in the bucket. Create "processedimages" under the bucket you have created
+    currentTime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    
+    localEntityJsonFilename = local_path+file_name+"_Entities.json"
+    with open(localEntityJsonFilename, "w") as outfile:
+        json.dump(phientity, outfile)
+    s3.meta.client.upload_file(localEntityJsonFilename, bucket, output_key + str(currentTime)+'_EntitiesV2.json')
+    
+    localPHIJsonFilename = local_path+file_name+"_PHIdata.json"
+    with open(localPHIJsonFilename, "w") as outfile:
+        json.dump(philist, outfile)
+    s3.meta.client.upload_file(localPHIJsonFilename, bucket, output_key + str(currentTime)+'_PHIData.json')
+    
+    zipFilepath = local_path + file_name + currentTime
+    with zipfile.ZipFile(zipFilepath, 'w') as zipf:
+        zipf.write(localEntityJsonFilename, compress_type=zipfile.ZIP_DEFLATED)
+        zipf.write(localPHIJsonFilename, compress_type=zipfile.ZIP_DEFLATED)
+        
+    s3.meta.client.upload_file(zipFilepath, bucket, output_key + '_' + str(currentTime)+'_compressed.zip')
+
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps("Processed Successfully")
+    }
